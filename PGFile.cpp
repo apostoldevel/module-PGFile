@@ -71,6 +71,7 @@ namespace Apostol {
                         throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
 
                     if (pqResults[QUERY_INDEX_DATA].Count() == 0) {
+                        DeleteHandler(pHandler);
                         return;
                     }
 
@@ -93,6 +94,7 @@ namespace Apostol {
                     const auto &caAbsoluteName = path_separator(caPath.back()) ? caPath + name : caPath + "/" + name;
 
                     if (data.empty()) {
+                        DeleteHandler(pHandler);
                         return;
                     }
 
@@ -119,6 +121,7 @@ namespace Apostol {
                             pHandler->Done() = done;
                             pHandler->Fail() = fail;
 
+                            pHandler->Lock();
                             DoLink(pHandler);
 
                             return;
