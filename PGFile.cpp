@@ -122,7 +122,12 @@ namespace Apostol {
                             pHandler->Fail() = fail;
 
                             pHandler->Lock();
-                            DoLink(pHandler);
+
+                            if (m_Type == "curl") {
+                                DoLink(pHandler);
+                            } else {
+                                DoFetch(pHandler);
+                            }
 
                             return;
                         }
