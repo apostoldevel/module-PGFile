@@ -225,7 +225,7 @@ namespace Apostol {
             SQL.Add("LISTEN " PG_LISTEN_NAME ";");
 
             try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                ExecSQL(SQL, nullptr, OnExecuted, OnException, PG_CONFIG_NAME);
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
             }
