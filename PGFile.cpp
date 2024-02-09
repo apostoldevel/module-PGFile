@@ -85,6 +85,7 @@ namespace Apostol {
                     const auto &path = caFile["path"];
                     const auto &name = caFile["name"];
                     const auto &hash = caFile["hash"];
+                    const auto &mime = caFile["mime"];
                     const auto &data = caFile["data"];
                     const auto &done = caFile["done"];
                     const auto &fail = caFile["fail"];
@@ -99,6 +100,7 @@ namespace Apostol {
                     }
 
                     pHandler->AbsoluteName() = caAbsoluteName;
+                    pHandler->Done() = done;
 
                     if (type == "-") {
                         const bool changed = (operation == "UPDATE" && ((oldAbsoluteName != caAbsoluteName) || (old_hash != hash)));
@@ -108,10 +110,18 @@ namespace Apostol {
                         }
 
                         if (operation == "INSERT" || changed) {
-                            const auto &decode = base64_decode(squeeze(data));
+                            CHTTPReply Reply;
 
                             DeleteFile(caAbsoluteName);
-                            decode.SaveToFile(caAbsoluteName.c_str());
+
+                            Reply.Content = base64_decode(squeeze(data));
+                            Reply.ContentLength = Reply.Content.Length();
+                            Reply.Content.SaveToFile(caAbsoluteName.c_str());
+                            Reply.Headers.Values("Content-Type", mime);
+
+                            DoDone(pHandler, Reply);
+
+                            return;
                         }
                     } else if (type == "l") {
                         const auto &decode = base64_decode(squeeze(data));
