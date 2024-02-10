@@ -131,8 +131,6 @@ namespace Apostol {
                             pHandler->Done() = done;
                             pHandler->Fail() = fail;
 
-                            pHandler->Lock();
-
                             if (m_Type == "curl") {
                                 DoLink(pHandler);
                             } else {
