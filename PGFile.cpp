@@ -248,7 +248,7 @@ namespace Apostol {
 
         void CPGFile::Heartbeat(CDateTime Now) {
             if ((Now >= m_CheckDate)) {
-                m_CheckDate = Now + (CDateTime) 1 / MinsPerDay; // 1 min
+                m_CheckDate = Now + (CDateTime) 30 / SecsPerDay; // 30 sec
                 CheckListen();
             }
 
