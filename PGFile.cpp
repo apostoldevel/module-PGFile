@@ -55,14 +55,13 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
+                const auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
 
                 if (pHandler == nullptr)
                     return;
 
-                CPQueryResults pqResults;
-
                 try {
+                    CPQueryResults pqResults;
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
                     const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
@@ -151,13 +150,13 @@ namespace Apostol {
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
                 DoError(E);
-                auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
+                const auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
                 if (pHandler != nullptr) {
                     DeleteHandler(pHandler);
                 }
             };
 
-            auto pHandler = dynamic_cast<CFileHandler *> (AHandler);
+            const auto pHandler = dynamic_cast<CFileHandler *> (AHandler);
 
             AHandler->Allow(false);
             IncProgress();
@@ -207,7 +206,7 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
                 try {
-                    auto pResult = APollQuery->Results(0);
+                    const auto pResult = APollQuery->Results(0);
 
                     if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
                         throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
@@ -215,7 +214,7 @@ namespace Apostol {
 
                     APollQuery->Connection()->Listeners().Add(PG_LISTEN_NAME);
 #if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                    APollQuery->Connection()->OnNotify([this](auto && APollQuery, auto && ANotify) { DoPostgresNotify(APollQuery, ANotify); });
+                    APollQuery->Connection()->OnNotify([this](auto && AConnection, auto && ANotify) { DoPostgresNotify(AConnection, ANotify); });
 #else
                     APollQuery->Connection()->OnNotify(std::bind(&CPGFile::DoPostgresNotify, this, _1, _2));
 #endif
@@ -247,13 +246,13 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CPGFile::Heartbeat(CDateTime Now) {
-            if ((Now >= m_CheckDate)) {
-                m_CheckDate = Now + (CDateTime) 30 / SecsPerDay; // 30 sec
+            if (Now >= m_CheckDate) {
+                m_CheckDate = Now + static_cast<CDateTime>(30) / SecsPerDay; // 30 sec
                 CheckListen();
             }
 
-            if ((Now >= m_AuthDate)) {
-                m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
+            if (Now >= m_AuthDate) {
+                m_AuthDate = Now + static_cast<CDateTime>(5) / SecsPerDay; // 5 sec
                 Authentication();
             }
 
