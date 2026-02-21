@@ -2,7 +2,7 @@
 
 Postgres File
 -
-**PGFile** is a module for [Apostol](https://github.com/apostoldevel/apostol).
+**PGFile** is a module for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
 
 Description
 -
@@ -88,3 +88,5 @@ Related modules
 Installation
 -
 Follow the build and installation instructions for [Apostol](https://github.com/apostoldevel/apostol#build-and-installation).
+
+[^crm]: **Apostol CRM** is an abstract term, not a standalone product. It refers to any project that uses both the [Apostol](https://github.com/apostoldevel/apostol) C++ framework and [db-platform](https://github.com/apostoldevel/db-platform) together through purpose-built modules and processes. Each framework can be used independently; combined, they form a full-stack backend platform.
