@@ -1,272 +1,371 @@
-/*++
+#ifdef WITH_POSTGRESQL
 
-Program name:
-
-  Apostol CRM
-
-Module Name:
-
-  PGFile.cpp
-
-Notices:
-
-  Module: PGFile
-
-Author:
-
-  Copyright (c) Prepodobny Alen
-
-  mailto: alienufo@inbox.ru
-  mailto: ufocomp@gmail.com
-
---*/
-
-//----------------------------------------------------------------------------------------------------------------------
-
-#include "Core.hpp"
 #include "PGFile.hpp"
-//----------------------------------------------------------------------------------------------------------------------
+#include "apostol/application.hpp"
 
-#define PG_CONFIG_NAME "helper"
-#define PG_LISTEN_NAME "file"
+#include "apostol/base64.hpp"
+#include "apostol/file_utils.hpp"
+#include "apostol/pg_utils.hpp"
 
-#define QUERY_INDEX_AUTH     0
-#define QUERY_INDEX_DATA     1
-//----------------------------------------------------------------------------------------------------------------------
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
-extern "C++" {
+namespace apostol
+{
 
-namespace Apostol {
+// ─── Construction ────────────────────────────────────────────────────────────
 
-    namespace Module {
+PGFile::PGFile(Application& app, EventLoop& loop)
+    : pool_(app.db_pool())
+    , fetch_(loop)
+    , bot_(app.db_pool(), "PGFile/2.0", "127.0.0.1")
+    , enabled_(true)
+{
+    // Read path and timeout from config
+    std::string path_str;
+    int timeout = 60;
+    if (auto* cfg = app.module_config("PGFile")) {
+        if (cfg->contains("path"))
+            path_str = (*cfg)["path"].get<std::string>();
+        if (cfg->contains("timeout") && (*cfg)["timeout"].is_number())
+            timeout = (*cfg)["timeout"].get<int>();
+    }
 
-        //--------------------------------------------------------------------------------------------------------------
+    files_path_ = app.resolve_path(path_str, "files");
+    timeout_secs_ = timeout > 0 ? timeout : 60;
 
-        //-- CPGFile ---------------------------------------------------------------------------------------------------
+    if (timeout_secs_ > 0)
+        fetch_.set_timeout(static_cast<long>(timeout_secs_) * 1000);
 
-        //--------------------------------------------------------------------------------------------------------------
+    // Load OAuth2 "service" credentials for bot session
+    auto [client_id, client_secret] = app.providers().credentials("service");
+    if (!client_id.empty())
+        bot_.set_credentials(client_id, client_secret);
+}
 
-        CPGFile::CPGFile(CModuleProcess *AProcess): CFileCommon(AProcess, "pg file", "module/PGFile") {
-            m_CheckDate = 0;
+// ─── Lifecycle ──────────────────────────────────────────────────────────────
+
+void PGFile::on_start()
+{
+    pool_.listen("file", [this](std::string_view ch, std::string_view payload) {
+        try {
+            on_notify(ch, payload);
+        } catch (const std::exception& e) {
+            // Never let exceptions escape from NOTIFY callback
+            (void)e;
         }
-        //--------------------------------------------------------------------------------------------------------------
+    });
+}
 
-        void CPGFile::DoFile(CQueueHandler *AHandler) {
+void PGFile::on_stop()
+{
+    pool_.unlisten("file");
+    bot_.sign_out();
+}
 
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
+// ─── on_notify ──────────────────────────────────────────────────────────────
 
-                const auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
+void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
+{
+    if (payload.empty())
+        return;
 
-                if (pHandler == nullptr)
-                    return;
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(payload);
+    } catch (...) {
+        return; // malformed payload
+    }
 
-                try {
-                    CPQueryResults pqResults;
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
+    // Safe accessor: returns default for missing keys AND null values
+    auto jstr = [&](const char* key, const char* def = "") -> std::string {
+        auto it = j.find(key);
+        if (it == j.end() || it->is_null())
+            return def;
+        return it->get<std::string>();
+    };
 
-                    const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
+    auto task = std::make_shared<FileTask>();
 
-                    if (authorize["authorized"] != "t")
-                        throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
+    task->id        = jstr("id");
+    task->session   = jstr("session");
+    task->operation = jstr("operation");
+    task->type      = jstr("type", "-");
+    task->path      = jstr("path", "/");
+    task->name      = jstr("name");
+    task->hash      = jstr("hash");
+    // done/fail are NOT in the NOTIFY payload — they come from api.get_file() result
 
-                    if (pqResults[QUERY_INDEX_DATA].Count() == 0) {
-                        DeleteHandler(pHandler);
-                        return;
-                    }
+    if (task->id.empty())
+        return;
 
-                    const auto &caFile = pqResults[QUERY_INDEX_DATA].First();
+    // Build absolute path
+    auto rel_path = task->path;
+    if (!rel_path.empty() && rel_path.front() == '/')
+        rel_path = rel_path.substr(1);
 
-                    const auto &operation = pHandler->Operation();
-                    const auto &old_hash = pHandler->Hash();
-                    const CString oldAbsoluteName(pHandler->AbsoluteName());
+    auto dir = files_path_ / rel_path;
+    task->absolute_name = (dir / task->name).string();
 
-                    const auto &type = caFile["type"];
-                    const auto &path = caFile["path"];
-                    const auto &name = caFile["name"];
-                    const auto &hash = caFile["hash"];
-                    const auto &mime = caFile["mime"];
-                    const auto &data = caFile["data"];
-                    const auto &done = caFile["done"];
-                    const auto &fail = caFile["fail"];
+    task->deadline = std::chrono::steady_clock::now()
+                   + std::chrono::seconds(timeout_secs_ + 10);
 
-                    const auto &caPath = m_Path + (path_separator(path.front()) ? path.substr(1) : path);
-                    ForceDirectories(caPath.c_str(), 0755);
-                    const auto &caAbsoluteName = path_separator(caPath.back()) ? caPath + name : caPath + "/" + name;
+    queue_.push_back(std::move(task));
+}
 
-                    if (data.empty()) {
-                        DeleteHandler(pHandler);
-                        return;
-                    }
+// ─── heartbeat ──────────────────────────────────────────────────────────────
 
-                    pHandler->AbsoluteName() = caAbsoluteName;
-                    pHandler->Done() = done;
+void PGFile::heartbeat(std::chrono::system_clock::time_point /*now*/)
+{
+    bot_.refresh_if_needed();
+    process_queue();
+    check_timeouts(std::chrono::steady_clock::now());
+}
 
-                    if (type == "-") {
-                        const bool changed = (operation == "UPDATE" && ((oldAbsoluteName != caAbsoluteName) || (old_hash != hash)));
+// ─── process_queue ──────────────────────────────────────────────────────────
 
-                        if (operation == "UPDATE" && (oldAbsoluteName != caAbsoluteName)) {
-                            DeleteFile(oldAbsoluteName);
-                        }
+void PGFile::process_queue()
+{
+    if (!bot_.valid())
+        return;
 
-                        if (operation == "INSERT" || changed) {
-                            CHTTPReply Reply;
+    for (auto& task : queue_) {
+        if (!task->in_progress) {
+            task->in_progress = true;
 
-                            DeleteFile(caAbsoluteName);
-
-                            Reply.Content = base64_decode(squeeze(data));
-                            Reply.ContentLength = Reply.Content.Length();
-                            Reply.Content.SaveToFile(caAbsoluteName.c_str());
-                            Reply.Headers.Values("Content-Type", mime);
-
-                            DoDone(pHandler, Reply);
-
-                            return;
-                        }
-                    } else if (type == "l") {
-                        const auto &decode = base64_decode(squeeze(data));
-
-                        if ((decode.substr(0, 8) == FILE_COMMON_HTTPS || decode.substr(0, 7) == FILE_COMMON_HTTP)) {
-                            pHandler->URI() = decode;
-                            pHandler->Done() = done;
-                            pHandler->Fail() = fail;
-
-                            if (m_Type == "curl") {
-                                DoCURL(pHandler);
-                            } else {
-                                DoFetch(pHandler);
-                            }
-
-                            return;
-                        }
-                    } else if (type == "s") {
-                        DeleteFile(oldAbsoluteName);
-                    }
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
-                }
-
-                DeleteHandler(pHandler);
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoError(E);
-                const auto pHandler = dynamic_cast<CFileHandler *> (APollQuery->Binding());
-                if (pHandler != nullptr) {
-                    DeleteHandler(pHandler);
-                }
-            };
-
-            const auto pHandler = dynamic_cast<CFileHandler *> (AHandler);
-
-            AHandler->Allow(false);
-            IncProgress();
-
-            const auto &operation = pHandler->Operation();
-            const auto &path = pHandler->Path();
-            const auto &name = pHandler->Name();
-
-            const auto &caPath = m_Path + (path_separator(path.front()) ? path.substr(1) : path);
-            const auto &caAbsoluteName = path_separator(caPath.back()) ? caPath + name : caPath + "/" + name;
-
-            pHandler->AbsoluteName() = caAbsoluteName;
-
-            if (operation == "DELETE") {
-                DeleteFile(caAbsoluteName);
-                DeleteHandler(AHandler);
-            } else {
-                CStringList SQL;
-
-                api::authorize(SQL, m_Session);
-                api::get_file(SQL, pHandler->FileId());
-
-                try {
-                    ExecSQL(SQL, AHandler, OnExecuted, OnException);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(AHandler, E.Message());
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CPGFile::DoPostgresNotify(CPQConnection *AConnection, PGnotify *ANotify) {
-            DebugNotify(AConnection, ANotify);
-
-            if (CompareString(ANotify->relname, PG_LISTEN_NAME) == 0) {
-#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                new CFileHandler(this, ANotify->extra, [this](auto &&Handler) { DoFile(Handler); });
-#else
-                new CFileHandler(this, ANotify->extra, std::bind(&CPGFile::DoFile, this, _1));
-#endif
-                UnloadQueue();
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CPGFile::InitListen() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                try {
-                    const auto pResult = APollQuery->Results(0);
-
-                    if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                    }
-
-                    APollQuery->Connection()->Listeners().Add(PG_LISTEN_NAME);
-#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                    APollQuery->Connection()->OnNotify([this](auto && AConnection, auto && ANotify) { DoPostgresNotify(AConnection, ANotify); });
-#else
-                    APollQuery->Connection()->OnNotify(std::bind(&CPGFile::DoPostgresNotify, this, _1, _2));
-#endif
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            SQL.Add("LISTEN " PG_LISTEN_NAME ";");
-
-            try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException, PG_CONFIG_NAME);
-            } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CPGFile::CheckListen() {
-            if (!PQClient(PG_CONFIG_NAME).CheckListen(PG_LISTEN_NAME))
-                InitListen();
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CPGFile::Heartbeat(CDateTime Now) {
-            if (Now >= m_CheckDate) {
-                m_CheckDate = Now + static_cast<CDateTime>(30) / SecsPerDay; // 30 sec
-                CheckListen();
+            if (task->operation == "DELETE") {
+                // DELETE → just remove file from disk
+                delete_file(task->absolute_name);
+                remove_task(task->id);
+                return; // iterator invalidated
             }
 
-            if (Now >= m_AuthDate) {
-                m_AuthDate = Now + static_cast<CDateTime>(5) / SecsPerDay; // 5 sec
-                Authentication();
-            }
-
-            UnloadQueue();
-            CheckTimeOut(Now);
+            do_file(task);
         }
-        //--------------------------------------------------------------------------------------------------------------
-
-        bool CPGFile::Enabled() {
-            if (m_ModuleStatus == msUnknown)
-                m_ModuleStatus = Config()->IniFile().ReadBool(SectionName().c_str(), "enable", true) ? msEnabled : msDisabled;
-            return m_ModuleStatus == msEnabled;
-        }
-        //--------------------------------------------------------------------------------------------------------------
     }
 }
+
+// ─── do_file ────────────────────────────────────────────────────────────────
+//
+// Mirrors v1 CPGFile::DoFile():
+//   api.authorize(session) + api.get_file(id) → process result
+
+void PGFile::do_file(std::shared_ptr<FileTask> task)
+{
+    // Use bot session for authorization, then get file
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.get_file({}::uuid)",
+        pq_quote_literal(bot_.session()),
+        pq_quote_literal(task->id));
+
+    pool_.execute(sql,
+        [this, task](std::vector<PgResult> results) {
+            // results[0] = authorize, results[1] = get_file
+            if (results.size() < 2) {
+                do_fail(task, "incomplete PG result");
+                return;
+            }
+
+            auto& file_result = results[1];
+            if (!file_result.ok() || file_result.rows() == 0) {
+                do_fail(task, "file not found in database");
+                return;
+            }
+
+            // Access columns by name (api.get_file returns SETOF api.file_data)
+            auto col = [&](const char* name) -> std::string {
+                int idx = file_result.column_index(name);
+                if (idx < 0) return {};
+                const char* v = file_result.value(0, idx);
+                return (v && v[0] != '\0') ? std::string(v) : std::string{};
+            };
+
+            auto type = col("type");
+            auto data = col("data");
+            auto path = col("path");
+            auto name = col("name");
+
+            if (type.empty()) type = task->type;
+
+            // Extract done/fail callback function names from DB result
+            task->done = col("done");
+            task->fail = col("fail");
+
+            // Update task fields from DB result
+            if (!path.empty()) task->path = path;
+            if (!name.empty()) task->name = name;
+
+            // Rebuild absolute name with possibly updated path
+            auto rel_path = task->path;
+            if (!rel_path.empty() && rel_path.front() == '/')
+                rel_path = rel_path.substr(1);
+            auto dir = files_path_ / rel_path;
+            task->absolute_name = (dir / task->name).string();
+
+            if (data.empty()) {
+                // No data — nothing to write
+                remove_task(task->id);
+                return;
+            }
+
+            if (type == "-") {
+                // Regular file: base64 decode → write to disk
+                try {
+                    auto decoded = base64_decode(data);
+                    auto content_type = col("mime");
+                    if (content_type.empty()) content_type = "application/octet-stream";
+
+                    delete_file(task->absolute_name);
+                    if (!write_file(task->absolute_name, decoded)) {
+                        do_fail(task, "failed to write file: " + task->absolute_name);
+                        return;
+                    }
+
+                    do_done(task, decoded, content_type);
+                } catch (const std::exception& e) {
+                    do_fail(task, fmt::format("decode error: {}", e.what()));
+                }
+            } else if (type == "l") {
+                // Link: data is base64-encoded URL
+                try {
+                    auto url = base64_decode(data);
+                    if (url.substr(0, 8) == "https://" || url.substr(0, 7) == "http://") {
+                        do_curl(task, url);
+                    } else {
+                        do_fail(task, "invalid URL in file data");
+                    }
+                } catch (const std::exception& e) {
+                    do_fail(task, fmt::format("decode URL error: {}", e.what()));
+                }
+            } else if (type == "s") {
+                // Storage (S3): delete local copy — S3 is authoritative
+                delete_file(task->absolute_name);
+                remove_task(task->id);
+            } else {
+                do_fail(task, "unknown file type: " + type);
+            }
+        },
+        [this, task](std::string_view error) {
+            do_fail(task, fmt::format("PG error: {}", error));
+        });
 }
+
+// ─── do_curl ────────────────────────────────────────────────────────────────
+
+void PGFile::do_curl(std::shared_ptr<FileTask> task, const std::string& url)
+{
+    fetch_.get(url, {},
+        // on_done
+        [this, task](FetchResponse resp) {
+            if (resp.status_code == 200) {
+                delete_file(task->absolute_name);
+                if (!write_file(task->absolute_name, resp.body)) {
+                    do_fail(task, "failed to write fetched file");
+                    return;
+                }
+
+                // Determine content type from response headers
+                std::string content_type = "application/octet-stream";
+                for (const auto& [k, v] : resp.headers) {
+                    if (k == "Content-Type" || k == "content-type") {
+                        content_type = v;
+                        break;
+                    }
+                }
+
+                do_done(task, resp.body, content_type);
+            } else {
+                do_fail(task, fmt::format("HTTP {} fetching file", resp.status_code));
+            }
+        },
+        // on_error
+        [this, task](std::string_view error) {
+            do_fail(task, fmt::format("fetch error: {}", error));
+        });
+}
+
+// ─── do_done ────────────────────────────────────────────────────────────────
+//
+// Call the "done" PG callback: done_func(id, path, size, hash, content_type)
+
+void PGFile::do_done(std::shared_ptr<FileTask> task,
+                     std::string_view body, std::string_view content_type)
+{
+    if (task->done.empty()) {
+        // No callback configured — just remove the task
+        remove_task(task->id);
+        return;
+    }
+
+    auto hash = sha256_hex(body);
+    auto sql = fmt::format(
+        "SELECT {}({}, {}, {}, {}, {})",
+        task->done,
+        pq_quote_literal(task->id),
+        pq_quote_literal(task->absolute_name),
+        body.size(),
+        pq_quote_literal(hash),
+        pq_quote_literal(std::string(content_type)));
+
+    pool_.execute(sql,
+        [this, task](std::vector<PgResult> /*results*/) {
+            remove_task(task->id);
+        },
+        [this, task](std::string_view /*error*/) {
+            remove_task(task->id);
+        },
+        /*quiet=*/true);
+}
+
+// ─── do_fail ────────────────────────────────────────────────────────────────
+//
+// Call the "fail" PG callback: fail_func(id, message)
+
+void PGFile::do_fail(std::shared_ptr<FileTask> task, std::string_view message)
+{
+    if (task->fail.empty()) {
+        // No callback configured — just remove the task
+        remove_task(task->id);
+        return;
+    }
+
+    auto sql = fmt::format("SELECT {}({}, {})",
+                           task->fail,
+                           pq_quote_literal(task->id),
+                           pq_quote_literal(std::string(message)));
+
+    pool_.execute(sql,
+        [this, task](std::vector<PgResult> /*results*/) {
+            remove_task(task->id);
+        },
+        [this, task](std::string_view /*error*/) {
+            remove_task(task->id);
+        },
+        /*quiet=*/true);
+}
+
+// ─── check_timeouts ─────────────────────────────────────────────────────────
+
+void PGFile::check_timeouts(std::chrono::steady_clock::time_point now)
+{
+    for (auto& task : queue_) {
+        if (task->in_progress && now >= task->deadline) {
+            do_fail(task, "file operation timeout");
+        }
+    }
+}
+
+// ─── remove_task ────────────────────────────────────────────────────────────
+
+void PGFile::remove_task(const std::string& id)
+{
+    queue_.erase(
+        std::remove_if(queue_.begin(), queue_.end(),
+            [&id](const auto& t) { return t->id == id; }),
+        queue_.end());
+}
+
+} // namespace apostol
+
+#endif // WITH_POSTGRESQL

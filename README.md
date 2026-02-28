@@ -1,8 +1,8 @@
-[![ru](https://img.shields.io/badge/lang-ru-green.svg)](https://github.com/apostoldevel/module-PGFile/blob/master/README.ru-RU.md)
+[![ru](https://img.shields.io/badge/lang-ru-green.svg)](README.ru-RU.md)
 
 Postgres File
 -
-**PGFile** is a module for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
+**PGFile** — a module for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
 
 Description
 -
@@ -10,7 +10,7 @@ Description
 
 The module runs as a long-lived **Helper** inside the Apostol helper process, sharing the same `epoll`-based event loop — no threads, no blocking I/O.
 
-> **PGFile** and **FileServer** are complementary modules that share the `FileCommon` base class. PGFile populates the filesystem from the database; FileServer serves those files over HTTP.
+> **PGFile** and **FileServer** are complementary modules. PGFile populates the filesystem from the database; FileServer serves those files over HTTP.
 
 How it works
 -
@@ -22,7 +22,7 @@ The `db.file` table has an `AFTER INSERT/UPDATE/DELETE` trigger (`t_file_notify`
 
 PGFile:
 1. Subscribes to the `file` PostgreSQL notify channel via `LISTEN file`.
-2. On notification — fetches the full file record from the database via `api.get_file(id)`.
+2. On notification — parses the payload and enqueues a file task.
 3. Based on the operation and file type — writes, replaces, downloads, or removes the file.
 
 File types
@@ -30,7 +30,7 @@ File types
 | Type | DB meaning | PGFile action |
 |------|-----------|---------------|
 | `-`  | Regular file | Decode base64 content from `data` column, write to filesystem. |
-| `l`  | Symbolic link (URL) | The `data` column contains an HTTP/HTTPS URL; fetch the remote resource via the built-in HTTP client or cURL and save it. |
+| `l`  | Symbolic link (URL) | The `data` column contains an HTTP/HTTPS URL; fetch the remote resource via cURL and save it. |
 | `s`  | Storage (S3) | Remove the local copy from filesystem — S3 is now the authoritative store. |
 | `d`  | Directory | Not handled directly; directories are created on demand when writing files. |
 
@@ -73,17 +73,21 @@ Configuration
 -
 Enable the module in the Apostol configuration file:
 
-```ini
-[module/PGFile]
-enable=true
+```json
+{
+  "modules": {
+    "PGFile": {
+      "enabled": true
+    }
+  }
+}
 ```
 
 Related modules
 -
-- **FileServer** — serves files managed by PGFile over HTTP (`GET /file/<uuid>/...`)
-- **PGFetch** — required for S3 uploads: `PutFileToS3` uses `http.fetch` to PUT files to S3 asynchronously
+- **[FileServer](https://github.com/apostoldevel/module-FileServer)** — serves files managed by PGFile over HTTP (`GET /file/...`)
+- **[PGFetch](https://github.com/apostoldevel/module-PGFetch)** — required for S3 uploads: `PutFileToS3` uses `http.fetch` to PUT files to S3 asynchronously
 - **db-platform `file` module** — database layer: `db.file` table, `api.get_file`, `PutFileToS3`, REST endpoints, `t_file_notify` trigger
-- **FileCommon** (`src/common/FileCommon`) — shared C++ base class: authentication, queue, `CFileHandler`, cURL support
 
 Installation
 -

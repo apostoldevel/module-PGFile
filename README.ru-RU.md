@@ -1,4 +1,4 @@
-[![en](https://img.shields.io/badge/lang-en-green.svg)](https://github.com/apostoldevel/module-PGFile/blob/master/README.md)
+[![en](https://img.shields.io/badge/lang-en-green.svg)](README.md)
 
 Postgres File
 -
@@ -10,7 +10,7 @@ Postgres File
 
 Модуль работает как долгоживущий **Helper** во вспомогательном процессе Апостол, используя общий цикл событий на основе `epoll` — без потоков, без блокирующего ввода-вывода.
 
-> **PGFile** и **FileServer** — взаимодополняющие модули на основе общего базового класса `FileCommon`. PGFile наполняет файловую систему данными из базы; FileServer раздаёт эти файлы по HTTP.
+> **PGFile** и **FileServer** — взаимодополняющие модули. PGFile наполняет файловую систему данными из базы; FileServer раздаёт эти файлы по HTTP.
 
 Принцип работы
 -
@@ -22,7 +22,7 @@ Postgres File
 
 PGFile:
 1. Подписывается на канал уведомлений PostgreSQL `file` через `LISTEN file`.
-2. При поступлении уведомления — считывает полную запись файла из базы данных через `api.get_file(id)`.
+2. При поступлении уведомления — разбирает payload и ставит задачу в очередь.
 3. В зависимости от операции и типа файла — записывает, заменяет, загружает или удаляет файл.
 
 Типы файлов
@@ -30,7 +30,7 @@ PGFile:
 | Тип | Значение в БД | Действие PGFile |
 |-----|--------------|-----------------|
 | `-` | Обычный файл | Декодировать base64-содержимое из колонки `data` и записать на диск. |
-| `l` | Символическая ссылка (URL) | Колонка `data` содержит HTTP/HTTPS URL; загрузить ресурс через встроенный HTTP-клиент или cURL и сохранить. |
+| `l` | Символическая ссылка (URL) | Колонка `data` содержит HTTP/HTTPS URL; загрузить ресурс через cURL и сохранить. |
 | `s` | Хранилище (S3) | Удалить локальную копию с диска — S3 теперь является авторитетным хранилищем. |
 | `d` | Директория | Не обрабатывается напрямую; директории создаются по мере необходимости при записи файлов. |
 
@@ -73,20 +73,24 @@ CREATE OR REPLACE FUNCTION schema.my_done (
 -
 Включите модуль в конфигурационном файле Апостол:
 
-```ini
-[module/PGFile]
-enable=true
+```json
+{
+  "modules": {
+    "PGFile": {
+      "enabled": true
+    }
+  }
+}
 ```
 
 Связанные модули
 -
-- **FileServer** — раздаёт файлы, управляемые PGFile, по HTTP (`GET /file/<uuid>/...`)
-- **PGFetch** — необходим для загрузки в S3: `PutFileToS3` использует `http.fetch` для асинхронной отправки PUT-запроса на S3
+- **[FileServer](https://github.com/apostoldevel/module-FileServer)** — раздаёт файлы, управляемые PGFile, по HTTP (`GET /file/...`)
+- **[PGFetch](https://github.com/apostoldevel/module-PGFetch)** — необходим для загрузки в S3: `PutFileToS3` использует `http.fetch` для асинхронной отправки PUT-запроса на S3
 - **Модуль `file` db-platform** — слой базы данных: таблица `db.file`, `api.get_file`, `PutFileToS3`, REST-эндпоинты, триггер `t_file_notify`
-- **FileCommon** (`src/common/FileCommon`) — общий базовый C++-класс: аутентификация, очередь, `CFileHandler`, поддержка cURL
 
 Установка
 -
-Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%83%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0).
+Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#build-and-installation).
 
 [^crm]: **Apostol CRM** — абстрактный термин, а не самостоятельный продукт. Он обозначает любой проект, в котором совместно используются фреймворк [Apostol](https://github.com/apostoldevel/apostol) (C++) и [db-platform](https://github.com/apostoldevel/db-platform) через специально разработанные модули и процессы. Каждый фреймворк можно использовать независимо; вместе они образуют полноценную backend-платформу.
