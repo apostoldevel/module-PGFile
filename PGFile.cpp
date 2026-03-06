@@ -110,6 +110,9 @@ void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
     task->deadline = std::chrono::steady_clock::now()
                    + std::chrono::seconds(timeout_secs_ + 10);
 
+    if (queue_.size() >= max_queue_size_)
+        return; // drop task — queue full
+
     queue_.push_back(std::move(task));
 }
 
@@ -129,20 +132,24 @@ void PGFile::process_queue()
     if (!bot_.valid())
         return;
 
+    // Collect DELETE task ids first (modifying queue_ during iteration is unsafe)
+    std::vector<std::string> delete_ids;
+
     for (auto& task : queue_) {
         if (!task->in_progress) {
             task->in_progress = true;
 
             if (task->operation == "DELETE") {
-                // DELETE → just remove file from disk
                 delete_file(task->absolute_name);
-                remove_task(task->id);
-                return; // iterator invalidated
+                delete_ids.push_back(task->id);
+            } else {
+                do_file(task);
             }
-
-            do_file(task);
         }
     }
+
+    for (auto& id : delete_ids)
+        remove_task(id);
 }
 
 // ─── do_file ────────────────────────────────────────────────────────────────

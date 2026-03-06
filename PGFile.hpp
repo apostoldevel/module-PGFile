@@ -90,6 +90,7 @@ private:
     bool                  enabled_;
 
     std::deque<std::shared_ptr<FileTask>> queue_;
+    std::size_t max_queue_size_{1000};
 };
 
 } // namespace apostol
