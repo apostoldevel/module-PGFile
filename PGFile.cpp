@@ -99,6 +99,10 @@ void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
     if (task->id.empty())
         return;
 
+    // Reject path traversal attempts
+    if (!is_safe_path(task->path) || !is_safe_path(task->name))
+        return;
+
     // Build absolute path
     auto rel_path = task->path;
     if (!rel_path.empty() && rel_path.front() == '/')
@@ -203,6 +207,12 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
             if (!path.empty()) task->path = path;
             if (!name.empty()) task->name = name;
 
+            // Reject path traversal attempts (DB values may differ from NOTIFY)
+            if (!is_safe_path(task->path) || !is_safe_path(task->name)) {
+                do_fail(task, "unsafe path in file record");
+                return;
+            }
+
             // Rebuild absolute name with possibly updated path
             auto rel_path = task->path;
             if (!rel_path.empty() && rel_path.front() == '/')
@@ -237,7 +247,7 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
                 // Link: data is base64-encoded URL
                 try {
                     auto url = base64_decode(data);
-                    if (url.substr(0, 8) == "https://" || url.substr(0, 7) == "http://") {
+                    if (url.starts_with("https://") || url.starts_with("http://")) {
                         do_curl(task, url);
                     } else {
                         do_fail(task, "invalid URL in file data");
@@ -356,11 +366,15 @@ void PGFile::do_fail(std::shared_ptr<FileTask> task, std::string_view message)
 
 void PGFile::check_timeouts(std::chrono::steady_clock::time_point now)
 {
+    std::vector<std::shared_ptr<FileTask>> timed_out;
+
     for (auto& task : queue_) {
-        if (task->in_progress && now >= task->deadline) {
-            do_fail(task, "file operation timeout");
-        }
+        if (task->in_progress && now >= task->deadline)
+            timed_out.push_back(task);
     }
+
+    for (auto& task : timed_out)
+        do_fail(task, "file operation timeout");
 }
 
 // ─── remove_task ────────────────────────────────────────────────────────────
