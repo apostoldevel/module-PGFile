@@ -209,7 +209,7 @@ namespace Apostol {
                     const auto pResult = APollQuery->Results(0);
 
                     if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                        throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                     }
 
                     APollQuery->Connection()->Listeners().Add(PG_LISTEN_NAME);
