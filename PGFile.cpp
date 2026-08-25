@@ -170,6 +170,9 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
         pq_quote_literal(bot_.session()),
         pq_quote_literal(task->id));
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     pool_.execute(sql,
         [this, task](std::vector<PgResult> results) {
             // results[0] = authorize, results[1] = get_file
@@ -265,7 +268,8 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
         },
         [this, task](std::string_view error) {
             do_fail(task, fmt::format("PG error: {}", error));
-        });
+        },
+        /*quiet=*/true);
 }
 
 // ─── do_curl ────────────────────────────────────────────────────────────────
