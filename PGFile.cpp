@@ -269,7 +269,10 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
         [this, task](std::string_view error) {
             do_fail(task, fmt::format("PG error: {}", error));
         },
-        /*quiet=*/true);
+        /*quiet=*/true,
+        // authorize + get_file read and change nothing: sent again after a
+        // lost connection, as before T627.
+        PgRetry::if_lost);
 }
 
 // ─── do_curl ────────────────────────────────────────────────────────────────
