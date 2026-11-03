@@ -26,6 +26,15 @@ PGFile:
 2. On notification — parses the payload and enqueues a file task.
 3. Based on the operation and file type — writes, replaces, downloads, or removes the file.
 
+Several backends on one database
+-
+The trigger sends through `notify.send('file', …)` of db-platform, and the mode of the notify channel `file` decides who hears it:
+
+- `legacy` (the default) or `broadcast` — a `NOTIFY` on `file` that every PGFile hears. Right for one backend, or for backends with a disk each. With several backends on a **shared** volume, every one writes each file — unless the helper runs under the leader gate (`process.leader`); PGFile says so in the log when the channel is `legacy` and the gate is off.
+- `single` — a row of `notify.queue` handed to exactly one PGFile (the common channel is silent). PGFile reads the mode every 10 s and, once it is `single`, takes rows through `NotifySubscriber` for the life of the process. The `done`/`fail` callback and the confirmation (`notify.ack`) are one transaction. A row not worked on — the queue is full, the stop began, no bot session until the deadline, or the work not finished at the stop — is given back with `notify.nack` and a reason that starts with `unsent:`; on its first delivery another PGFile takes it. A row that arrived while no PGFile listened waits in the queue (no event is lost by a restart).
+
+Switch `file` to `single` only when **every** backend on the database has a PGFile with this path: an older one hears nothing in that mode. The path is taken up only when the channel's `lease` is at least `2 × (timeout + 10 s) + 20 s`; otherwise PGFile logs why and stays on `LISTEN`.
+
 File types
 -
 | Type | DB meaning | PGFile action |

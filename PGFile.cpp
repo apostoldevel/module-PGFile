@@ -7,19 +7,56 @@
 #include "apostol/file_utils.hpp"
 #include "apostol/pg_utils.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 namespace apostol
 {
 
+namespace
+{
+
+// A task is bounded by timeout + 10 s twice: waiting to start (a row not
+// started by then is given back) and running (failed by then). The
+// confirmation that follows needs its own time — the margin PGFetch keeps.
+constexpr long deadline_extra_s = 10;
+constexpr long confirm_margin_s = 20;
+
+constexpr auto probe_retry = std::chrono::seconds(5);
+// No notify in the database: asked again, the platform may be updated under a running backend.
+constexpr auto probe_again = std::chrono::seconds(60);
+constexpr auto mode_every  = std::chrono::seconds(10);
+
+// The helper's leader gate (libapostol: process.leader). A libapostol without
+// it has no gate: every copy runs.
+template <typename Settings>
+bool leader_gate(const Settings& s)
+{
+    if constexpr (requires { s.leader; })
+        return s.leader;
+    else
+        return false;
+}
+
+} // namespace
+
 // ─── Construction ────────────────────────────────────────────────────────────
 
 PGFile::PGFile(Application& app, EventLoop& loop)
     : pool_(app.db_pool())
+    , log_(app.logger())
+    , modules_(app.module_manager())
     , fetch_(loop)
     , bot_(app.db_pool(), "PGFile/2.0", "127.0.0.1")
     , enabled_(true)
+    , gated_(leader_gate(app.settings()))
+#ifdef PGFILE_NOTIFY
+    , loop_(loop)
+    , node_(app.node_id())
+#endif
 {
     // Read path and timeout from config
     std::string path_str;
@@ -47,12 +84,14 @@ PGFile::PGFile(Application& app, EventLoop& loop)
 
 void PGFile::on_start()
 {
+    probe();
+
     pool_.listen("file", [this](std::string_view ch, std::string_view payload) {
         try {
             on_notify(ch, payload);
         } catch (const std::exception& e) {
             // Never let exceptions escape from NOTIFY callback
-            (void)e;
+            log_.error("PGFile: event of file not handled: {}", e.what());
         }
     });
 }
@@ -60,21 +99,185 @@ void PGFile::on_start()
 void PGFile::on_stop()
 {
     pool_.unlisten("file");
+#ifdef PGFILE_NOTIFY
+    stop_notify();
+#endif
     bot_.sign_out();
 }
 
-// ─── on_notify ──────────────────────────────────────────────────────────────
+// ─── probe / read_mode ──────────────────────────────────────────────────────
+//
+// The mode of the channel `file` decides the path: `single` — a row of
+// notify.queue for one PGFile (the shared common channel is silent then),
+// anything else — the NOTIFY on "file" every listener hears. A database
+// without notify has the second only.
+//
+// The pool may refuse a query (an epoll registration that fails): the flag is lowered and the next
+// heartbeat sends it again.
+
+void PGFile::probe()
+{
+    probing_ = true;
+    try {
+        pool_.execute(
+            "SELECT to_regprocedure('notify.take(bigint,integer)') IS NOT NULL"
+            " AND to_regprocedure('notify.channel_policy(text)') IS NOT NULL",
+            [this](std::vector<PgResult> results) {
+                probing_ = false;
+                const bool yes = !results.empty() && results[0].rows() > 0 && results[0].columns() > 0 &&
+                                 results[0].value(0, 0) != nullptr && results[0].value(0, 0)[0] == 't';
+                if (!yes) {
+                    next_probe_ = std::chrono::steady_clock::now() + probe_again;
+                    if (has_notify_ != false)
+                        log_.notice("PGFile: no notify in the database — events of file come by NOTIFY only");
+                } else if (has_notify_ == false) {
+                    log_.notice("PGFile: notify is in the database now — the mode of file is read");
+                }
+                has_notify_ = yes;
+            },
+            [this](std::string_view error) {
+                probing_ = false;
+                next_probe_ = std::chrono::steady_clock::now() + probe_retry;
+                log_.error("PGFile: probe for notify failed: {}", error);
+            });
+    } catch (const std::exception& e) {
+        probing_ = false;
+        next_probe_ = std::chrono::steady_clock::now() + probe_retry;
+        log_.error("PGFile: probe for notify not sent, the pool refused the query: {}", e.what());
+    }
+}
+
+// Read until the channel is single; from then on the subscriber stays for the
+// life of the module. A channel returned to legacy still has rows to bring to
+// their end, and notify.send alone decides which path a new event takes —
+// the LISTEN on "file" serves the other one meanwhile.
+//
+// The lease of the channel must outlast a task: a row whose
+// lease runs out is closed by the sweep as outcome unknown (`file` allows no
+// repeat) while this PGFile may still be writing it. A row waits up to
+// timeout + 10 s to start and runs up to timeout + 10 s more (the deadline is
+// set again at the start), and its confirmation needs time after that.
+// Short of it the path is not taken up.
+
+void PGFile::read_mode()
+{
+    reading_mode_ = true;
+    next_mode_ = std::chrono::steady_clock::now() + mode_every;
+
+    try {
+        pool_.execute(
+            "SELECT mode, extract(epoch FROM lease)::bigint FROM notify.channel_policy('file')",
+            [this](std::vector<PgResult> results) {
+                reading_mode_ = false;
+
+                if (modules_.stopped())
+                    return;
+#ifdef PGFILE_NOTIFY
+                if (notify_)
+                    return;
+#endif
+                // No row: no channel file — nothing but the path legacy.
+                if (results.empty() || !results[0].ok() || results[0].rows() == 0 || results[0].columns() < 2)
+                    return;
+
+                const char* mode_value = results[0].value(0, 0);
+                const std::string mode = mode_value != nullptr ? mode_value : "";
+
+                if (mode != "single") {
+                    // A NOTIFY every listener hears, and no
+                    // gate to make this PGFile the only one. Legal for one
+                    // backend; on a shared volume it is N writes per event.
+                    if (mode == "legacy" && !gated_ && !said_ungated_) {
+                        said_ungated_ = true;
+                        log_.warn("PGFile: the channel file is legacy and the helper runs without the leader gate "
+                                  "(process.leader) — every backend on this database writes each file; with more "
+                                  "than one on a shared volume, set the channel file to single");
+                    }
+                    return;
+                }
+
+#ifndef PGFILE_NOTIFY
+                if (refused_lease_ != -2) {
+                    refused_lease_ = -2;
+                    log_.error("PGFile: the channel file is single, and this build has no notify subscriber — "
+                               "no event of file reaches this PGFile");
+                }
+                return;
+#else
+                const char* lease = results[0].value(0, 1);
+                const long lease_s = lease != nullptr ? std::strtol(lease, nullptr, 10) : 0;
+                const long floor_s = 2 * (timeout_secs_ + deadline_extra_s) + confirm_margin_s;
+
+                if (lease_s < floor_s) {
+                    // Read again every mode_every: said as an error once per
+                    // lease value, then quietly, until the lease or the mode changes.
+                    const bool first = lease_s != refused_lease_;
+                    refused_lease_ = lease_s;
+                    const auto why = fmt::format("lease {} s is shorter than 2 × (timeout + {} s) + {} s ({} s) — "
+                                                 "the sweep would close a row this PGFile is still writing",
+                                                 lease_s, deadline_extra_s, confirm_margin_s, floor_s);
+                    if (first)
+                        log_.error("PGFile: the channel file is single, its path is not taken up: {}", why);
+                    else
+                        log_.debug("PGFile: the channel file is single, its path is not taken up: {}", why);
+                    return;
+                }
+
+                try {
+                    start_notify();
+                } catch (const std::exception& e) {
+                    // Read again at the next mode_every: nothing half-started stays.
+                    notify_.reset();
+                    log_.error("PGFile: the subscriber of file not started: {}", e.what());
+                }
+#endif
+            },
+            [this](std::string_view error) {
+                reading_mode_ = false;
+                log_.error("PGFile: the mode of the channel file is not read: {}", error);
+            });
+    } catch (const std::exception& e) {
+        reading_mode_ = false;
+        log_.error("PGFile: the mode of the channel file is not read, the pool refused the query: {}", e.what());
+    }
+}
+
+// ─── on_notify / make_task ──────────────────────────────────────────────────
 
 void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
 {
-    if (payload.empty())
+    std::string why;
+    auto task = make_task(payload, why);
+    if (!task) {
+        if (!why.empty())
+            log_.warn("PGFile: event of file ignored: {}", why);
         return;
+    }
+
+    if (queue_.size() >= max_queue_size_) {
+        log_.error("PGFile: queue full ({} tasks) — event of file {} dropped", queue_.size(), task->id);
+        return;
+    }
+
+    queue_.push_back(std::move(task));
+}
+
+std::shared_ptr<PGFile::FileTask> PGFile::make_task(std::string_view payload, std::string& why) const
+{
+    if (payload.empty())
+        return nullptr;
 
     nlohmann::json j;
     try {
         j = nlohmann::json::parse(payload);
     } catch (...) {
-        return; // malformed payload
+        why = "malformed payload";
+        return nullptr;
+    }
+
+    if (!j.is_object()) {
+        why = "payload is not an object";
+        return nullptr;
     }
 
     // Safe accessor: returns default for missing keys AND null values
@@ -82,26 +285,37 @@ void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
         auto it = j.find(key);
         if (it == j.end() || it->is_null())
             return def;
+        if (!it->is_string())
+            throw std::invalid_argument(fmt::format("key {} is not a string", key));
         return it->get<std::string>();
     };
 
     auto task = std::make_shared<FileTask>();
 
-    task->id        = jstr("id");
-    task->session   = jstr("session");
-    task->operation = jstr("operation");
-    task->type      = jstr("type", "-");
-    task->path      = jstr("path", "/");
-    task->name      = jstr("name");
-    task->hash      = jstr("hash");
+    try {
+        task->id        = jstr("id");
+        task->session   = jstr("session");
+        task->operation = jstr("operation");
+        task->type      = jstr("type", "-");
+        task->path      = jstr("path", "/");
+        task->name      = jstr("name");
+        task->hash      = jstr("hash");
+    } catch (const std::exception& e) {
+        why = e.what();
+        return nullptr;
+    }
     // done/fail are NOT in the NOTIFY payload — they come from api.get_file() result
 
-    if (task->id.empty())
-        return;
+    if (task->id.empty()) {
+        why = "no file id";
+        return nullptr;
+    }
 
     // Reject path traversal attempts
-    if (!is_safe_path(task->path) || !is_safe_path(task->name))
-        return;
+    if (!is_safe_path(task->path) || !is_safe_path(task->name)) {
+        why = fmt::format("file {}: unsafe path", task->id);
+        return nullptr;
+    }
 
     // Build absolute path
     auto rel_path = task->path;
@@ -112,21 +326,30 @@ void PGFile::on_notify(std::string_view /*channel*/, std::string_view payload)
     task->absolute_name = (dir / task->name).string();
 
     task->deadline = std::chrono::steady_clock::now()
-                   + std::chrono::seconds(timeout_secs_ + 10);
+                   + std::chrono::seconds(timeout_secs_ + deadline_extra_s);
 
-    if (queue_.size() >= max_queue_size_)
-        return; // drop task — queue full
-
-    queue_.push_back(std::move(task));
+    return task;
 }
 
 // ─── heartbeat ──────────────────────────────────────────────────────────────
 
 void PGFile::heartbeat(std::chrono::system_clock::time_point /*now*/)
 {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (!has_notify_.value_or(false) && !probing_ && now >= next_probe_)
+        probe();
+
+    bool read = has_notify_.value_or(false) && !reading_mode_ && now >= next_mode_;
+#ifdef PGFILE_NOTIFY
+    read = read && !notify_;
+#endif
+    if (read)
+        read_mode();
+
     bot_.refresh_if_needed();
     process_queue();
-    check_timeouts(std::chrono::steady_clock::now());
+    check_timeouts(now);
 }
 
 // ─── process_queue ──────────────────────────────────────────────────────────
@@ -136,24 +359,28 @@ void PGFile::process_queue()
     if (!bot_.valid())
         return;
 
-    // Collect DELETE task ids first (modifying queue_ during iteration is unsafe)
-    std::vector<std::string> delete_ids;
+    // Collected first: finishing a task takes it out of queue_.
+    std::vector<std::shared_ptr<FileTask>> deletes;
 
     for (auto& task : queue_) {
-        if (!task->in_progress) {
+        if (!task->in_progress && !task->settling) {
             task->in_progress = true;
+            // Bounded from its start: a wait for the bot session is not its time.
+            task->deadline = std::chrono::steady_clock::now()
+                           + std::chrono::seconds(timeout_secs_ + deadline_extra_s);
 
             if (task->operation == "DELETE") {
-                delete_file(task->absolute_name);
-                delete_ids.push_back(task->id);
+                deletes.push_back(task);
             } else {
                 do_file(task);
             }
         }
     }
 
-    for (auto& id : delete_ids)
-        remove_task(id);
+    for (auto& task : deletes) {
+        delete_file(task->absolute_name);
+        finish(task, {});
+    }
 }
 
 // ─── do_file ────────────────────────────────────────────────────────────────
@@ -173,8 +400,14 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
     // quiet: the statement carries a session code. PgPool prints statement
     // text at debug into postgres.log — inside the container, readable
     // by any process there.
+    try {
     pool_.execute(sql,
         [this, task](std::vector<PgResult> results) {
+            // Failed by its deadline (or given back at the stop) meanwhile:
+            // the disk is not touched, the outcome is written already.
+            if (task->settling)
+                return;
+
             // results[0] = authorize, results[1] = get_file
             if (results.size() < 2) {
                 do_fail(task, "incomplete PG result");
@@ -225,7 +458,7 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
 
             if (data.empty()) {
                 // No data — nothing to write
-                remove_task(task->id);
+                finish(task, {});
                 return;
             }
 
@@ -261,7 +494,7 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
             } else if (type == "s") {
                 // Storage (S3): delete local copy — S3 is authoritative
                 delete_file(task->absolute_name);
-                remove_task(task->id);
+                finish(task, {});
             } else {
                 do_fail(task, "unknown file type: " + type);
             }
@@ -273,6 +506,13 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
         // authorize + get_file read and change nothing: sent again after a
         // lost connection, as before T627.
         PgRetry::if_lost);
+    } catch (const std::exception& e) {
+        // The pool refused: not started — the next heartbeat tries
+        // again; on the path single a row still not started by its deadline
+        // is given back.
+        task->in_progress = false;
+        log_.error("PGFile: file {}: not read, the pool refused the query: {}", task->id, e.what());
+    }
 }
 
 // ─── do_curl ────────────────────────────────────────────────────────────────
@@ -283,6 +523,10 @@ void PGFile::do_curl(std::shared_ptr<FileTask> task, const std::string& url)
         // on_done
         [this, task](FetchResponse resp) {
             if (resp.status_code == 200) {
+                // Failed by its deadline meanwhile: the disk is not touched.
+                if (task->settling)
+                    return;
+
                 delete_file(task->absolute_name);
                 if (!write_file(task->absolute_name, resp.body)) {
                     do_fail(task, "failed to write fetched file");
@@ -316,9 +560,13 @@ void PGFile::do_curl(std::shared_ptr<FileTask> task, const std::string& url)
 void PGFile::do_done(std::shared_ptr<FileTask> task,
                      std::string_view body, std::string_view content_type)
 {
+    // One outcome per task: failed by its deadline meanwhile.
+    if (task->settling)
+        return;
+
     if (task->done.empty()) {
-        // No callback configured — just remove the task
-        remove_task(task->id);
+        // No callback configured — nothing to write but the end
+        finish(task, {});
         return;
     }
 
@@ -332,14 +580,17 @@ void PGFile::do_done(std::shared_ptr<FileTask> task,
         pq_quote_literal(hash),
         pq_quote_literal(std::string(content_type)));
 
-    pool_.execute(sql,
-        [this, task](std::vector<PgResult> /*results*/) {
-            remove_task(task->id);
-        },
-        [this, task](std::string_view /*error*/) {
-            remove_task(task->id);
-        },
-        /*quiet=*/true);
+    // Path single: a done callback that throws takes the confirmation down
+    // with it; the fail callback is written instead, so that the row ends.
+    Fallback fallback;
+    if (!task->fail.empty()) {
+        fallback = [task](std::string_view error) {
+            return fmt::format("SELECT {}({}, {})", task->fail, pq_quote_literal(task->id),
+                               pq_quote_literal(fmt::format("done callback rolled back: {}", error)));
+        };
+    }
+
+    finish(task, std::move(sql), std::move(fallback));
 }
 
 // ─── do_fail ────────────────────────────────────────────────────────────────
@@ -348,9 +599,15 @@ void PGFile::do_done(std::shared_ptr<FileTask> task,
 
 void PGFile::do_fail(std::shared_ptr<FileTask> task, std::string_view message)
 {
+    // One outcome per task.
+    if (task->settling)
+        return;
+
+    log_.warn("PGFile: file {}: {}", task->id, message);
+
     if (task->fail.empty()) {
-        // No callback configured — just remove the task
-        remove_task(task->id);
+        // No callback configured — nothing to write but the end
+        finish(task, {});
         return;
     }
 
@@ -359,40 +616,393 @@ void PGFile::do_fail(std::shared_ptr<FileTask> task, std::string_view message)
                            pq_quote_literal(task->id),
                            pq_quote_literal(std::string(message)));
 
-    pool_.execute(sql,
-        [this, task](std::vector<PgResult> /*results*/) {
-            remove_task(task->id);
-        },
-        [this, task](std::string_view /*error*/) {
-            remove_task(task->id);
-        },
-        /*quiet=*/true);
+    finish(task, std::move(sql));
+}
+
+// ─── finish ─────────────────────────────────────────────────────────────────
+
+void PGFile::finish(const std::shared_ptr<FileTask>& task, std::string sql, Fallback fallback)
+{
+    // One end per task: a second would race the first (and on the path
+    // single follow a nack with an ack).
+    if (task->settling)
+        return;
+    task->settling = true;
+
+#ifdef PGFILE_NOTIFY
+    if (task->row) {
+        settle_single(task, std::move(sql), std::move(fallback));
+        return;
+    }
+#endif
+    (void)fallback;
+
+    if (sql.empty()) {
+        remove_task(task);
+        return;
+    }
+
+    try {
+        pool_.execute(sql,
+            [this, task](std::vector<PgResult> /*results*/) {
+                remove_task(task);
+            },
+            [this, task](std::string_view error) {
+                log_.error("PGFile: file {}: callback failed: {}", task->id, error);
+                remove_task(task);
+            },
+            /*quiet=*/true);
+    } catch (const std::exception& e) {
+        log_.error("PGFile: file {}: callback not sent, the pool refused the query: {}", task->id, e.what());
+        remove_task(task);
+    }
 }
 
 // ─── check_timeouts ─────────────────────────────────────────────────────────
 
 void PGFile::check_timeouts(std::chrono::steady_clock::time_point now)
 {
+    // Collected first: finishing a task takes it out of queue_.
     std::vector<std::shared_ptr<FileTask>> timed_out;
+#ifdef PGFILE_NOTIFY
+    std::vector<std::shared_ptr<FileTask>> not_started;
+#endif
 
     for (auto& task : queue_) {
-        if (task->in_progress && now >= task->deadline)
+        if (task->settling || now < task->deadline)
+            continue;
+        if (task->in_progress)
             timed_out.push_back(task);
+#ifdef PGFILE_NOTIFY
+        // Taken, never started (no bot session all this time): another
+        // PGFile may have one. A row kept to its lease would be closed by the
+        // sweep as outcome unknown — `file` allows no repeat.
+        else if (task->row)
+            not_started.push_back(task);
+#endif
     }
 
     for (auto& task : timed_out)
         do_fail(task, "file operation timeout");
+
+#ifdef PGFILE_NOTIFY
+    for (auto& task : not_started) {
+        log_.warn("PGFile: file {}: not started within timeout + {} s (no bot session) — given back",
+                  task->id, deadline_extra_s);
+        give_back(task, "unsent: not started in time, no bot session");
+    }
+#endif
 }
 
 // ─── remove_task ────────────────────────────────────────────────────────────
+//
+// By the task, not by the file id: two events of one file —
+// two NOTIFYs, or two rows of notify.queue — are two tasks, and the end of one
+// must not take the other out.
 
-void PGFile::remove_task(const std::string& id)
+void PGFile::remove_task(const std::shared_ptr<FileTask>& task)
 {
-    queue_.erase(
-        std::remove_if(queue_.begin(), queue_.end(),
-            [&id](const auto& t) { return t->id == id; }),
-        queue_.end());
+    queue_.erase(std::remove(queue_.begin(), queue_.end(), task), queue_.end());
 }
+
+#ifdef PGFILE_NOTIFY
+
+// ─── path single: the subscriber ────────────────────────────────────────────
+
+void PGFile::start_notify()
+{
+    db_platform::NotifySubscriber::Options options;
+    options.channel     = "file";
+    options.node        = node_;
+    options.application = "PGFile";
+    options.role        = "helper";
+
+    notify_ = std::make_unique<db_platform::NotifySubscriber>(pool_, loop_, log_, std::move(options),
+        [this](const db_platform::NotifyRow& row) {
+            try {
+                on_row(row);
+            } catch (const std::exception& e) {
+                // The subscriber's callback is not the place to throw; the sweep closes the row by its lease.
+                log_.error("PGFile: row {} of file not handled: {}", row.id, e.what());
+            }
+        });
+
+    log_.notice("PGFile: the channel file is single — events are taken from notify.queue");
+    notify_->start();
+}
+
+// ─── path single: a row ─────────────────────────────────────────────────────
+
+void PGFile::on_row(const db_platform::NotifyRow& row)
+{
+    if (modules_.stopped()) {
+        notify_->refuse(row, "unsent: stopping, taken after the stop began");
+        return;
+    }
+
+    // The same row handed out again while this module still has it: whatever
+    // outcome is written here goes out under the new token.
+    for (const auto& t : queue_) {
+        if (t->row && t->row->id == row.id) {
+            log_.warn("PGFile: file {}: row {} delivered again (attempt {}) while still here — "
+                      "its outcome goes out under the new delivery", t->id, row.id, row.attempts);
+            t->row = row;
+            return;
+        }
+    }
+
+    // The payload is the event the NOTIFY would carry (db.ft_file_notify).
+    std::string why;
+    auto task = make_task(row.payload, why);
+    if (!task) {
+        // Nothing to act on (FR.02): refused, not repeated (`file` allows
+        // none) — closed with the reason kept in the row.
+        if (why.empty())
+            why = "empty payload";
+        log_.warn("PGFile: row {} of file ignored: {}", row.id, why);
+        try {
+            notify_->refuse(row, "malformed: " + why);
+        } catch (const std::exception& e) {
+            log_.error("PGFile: row {} of file not refused, the pool refused — the sweep closes it by its lease: {}",
+                       row.id, e.what());
+        }
+        return;
+    }
+
+    // A row taken is never left without an end. Not worked
+    // on — given back; on its first delivery it waits for another PGFile.
+    if (queue_.size() >= max_queue_size_) {
+        log_.error("PGFile: queue full ({} tasks) — row {} of file {} given back", queue_.size(), row.id, task->id);
+        try {
+            notify_->refuse(row, fmt::format("unsent: queue full ({} tasks)", queue_.size()));
+        } catch (const std::exception& e) {
+            log_.error("PGFile: row {} of file not given back, the pool refused: {}", row.id, e.what());
+        }
+        return;
+    }
+
+    task->row = row;
+    queue_.push_back(std::move(task));
+}
+
+// ─── path single: the outcome ───────────────────────────────────────────────
+//
+// The callback and the confirmation are one transaction (notify.ack, last):
+// under a token that is not current the whole of it is rolled back.
+//
+// The first send goes through the subscriber, which takes the row off its
+// list. The subscriber does not send again after a lost connection, and a
+// failure there may be either that or a statement that failed: the same
+// statement is sent once more by the module itself, on a pool that resends
+// after a lost connection — committed the first time, it is refused by the
+// confirmation (NT409) and changes nothing. Failing again, it is a statement
+// that fails: its fallback, if it has one, is written instead, and failing
+// that — the confirmation alone, so that the row ends.
+
+void PGFile::settle_single(std::shared_ptr<FileTask> task, std::string sql, Fallback fallback)
+{
+    task->settling = true;
+    const auto row = *task->row;
+
+    if (!notify_) {
+        settle_again(std::move(task), row, std::move(sql), std::move(fallback), false);
+        return;
+    }
+
+    auto on_done = [this, task](std::vector<PgResult>) { remove_task(task); };
+    auto on_fail = [this, task, row, sql, fallback](std::string_view error, bool stale) {
+        if (stale) {
+            settle_stale(task, row, sql, fallback);
+            return;
+        }
+        log_.warn("PGFile: file {}: outcome and confirmation not written ({}) — sent again", task->id, error);
+        settle_again(task, row, sql, fallback, false);
+    };
+
+    try {
+        // quiet: as on the path legacy.
+        notify_->complete(row, sql, std::move(on_done), std::move(on_fail), /*quiet=*/true);
+    } catch (const std::exception& e) {
+        log_.error("PGFile: file {}: outcome not sent, the pool refused — the sweep closes the row by its lease: {}",
+                   task->id, e.what());
+        remove_task(task);
+    }
+}
+
+void PGFile::settle_again(std::shared_ptr<FileTask> task, db_platform::NotifyRow row, std::string sql,
+                          Fallback fallback, bool last)
+{
+    auto statement = db_platform::NotifySubscriber::ack_sql(row, sql);
+
+    auto on_result = [this, task, row, sql, fallback, last](std::vector<PgResult> results) {
+        const auto bad = std::find_if(results.begin(), results.end(),
+            [](const PgResult& r) { return !r.ok(); });
+
+        if (bad == results.end()) {
+            remove_task(task);
+            return;
+        }
+
+        if (std::string_view(bad->sqlstate()) == "NT409") {
+            settle_stale(task, row, sql, fallback);
+            return;
+        }
+
+        const std::string error(bad->error_message());
+        // The connection or the server went: written or not is unknown — the
+        // fail callback beside a file maybe confirmed done would be a lie.
+        const std::string_view state(bad->sqlstate());
+        const bool unknown = state.empty() || state.starts_with("08") || state.starts_with("57P0");
+        if (!last && !unknown) {
+            log_.error("PGFile: file {}: callback rolled back: {}", task->id, error);
+            settle_again(task, row, fallback ? fallback(error) : std::string{}, {}, true);
+            return;
+        }
+
+        // Delivered again to this module while the last send was out: the
+        // row is held under the new token now.
+        if (task->row && task->row->token != row.token) {
+            settle_stale(task, row, sql, fallback);
+            return;
+        }
+
+        log_.error("PGFile: file {}: outcome not written, the sweep closes its row by the lease: {}", task->id, error);
+        remove_task(task);
+    };
+
+    try {
+        pool_.execute(std::move(statement), std::move(on_result), {}, /*quiet=*/true, PgRetry::if_lost);
+    } catch (const std::exception& e) {
+        log_.error("PGFile: file {}: outcome not sent, the pool refused — the sweep closes the row by its lease: {}",
+                   task->id, e.what());
+        remove_task(task);
+    }
+}
+
+// NT409: what was sent with the confirmation is rolled back. Either an
+// earlier send of this very outcome committed (a resend after a lost
+// connection), or the row is not this delivery's any more — or, delivered
+// again meanwhile, it is this module's under a new token.
+void PGFile::settle_stale(std::shared_ptr<FileTask> task, const db_platform::NotifyRow& row,
+                          std::string sql, Fallback fallback)
+{
+    if (task->row && task->row->token != row.token) {
+        log_.notice("PGFile: file {}: delivered again meanwhile — the outcome goes out under the new delivery",
+                    task->id);
+        settle_single(std::move(task), std::move(sql), std::move(fallback));
+        return;
+    }
+
+    log_.warn("PGFile: file {}: the row is not this delivery's any more — the outcome written here is "
+              "rolled back (written already, or closed by the sweep)", task->id);
+    remove_task(task);
+}
+
+// A row taken and not worked on, given back: notify.nack with a reason that
+// starts with `unsent:`. On its first delivery the row goes back to the queue
+// whatever max_attempts says (`file` has none) and another PGFile takes it.
+void PGFile::give_back(const std::shared_ptr<FileTask>& task, std::string_view reason)
+{
+    task->settling = true;
+    if (notify_ && task->row) {
+        try {
+            notify_->refuse(*task->row, reason);
+        } catch (const std::exception& e) {
+            log_.error("PGFile: file {}: row not given back, the pool refused — the sweep closes it by its lease: {}",
+                       task->id, e.what());
+        }
+    }
+    remove_task(task);
+}
+
+// ─── path single: the stop ──────────────────────────────────────────────────
+
+void PGFile::on_stopping()
+{
+    if (!notify_)
+        return;
+
+    // Not chosen as an addressee any more, nothing new taken.
+    notify_->drain();
+
+    // Rows taken and not started: given back, another PGFile writes them.
+    std::vector<std::shared_ptr<FileTask>> waiting;
+    for (const auto& t : queue_) {
+        if (t->row && !t->in_progress && !t->settling)
+            waiting.push_back(t);
+    }
+    for (const auto& t : waiting)
+        give_back(t, "unsent: stopping, not started");
+}
+
+// A row being worked on: the stop waits for it (up to process.stop_timeout;
+// a download ends by the timeout).
+bool PGFile::busy() const
+{
+    return std::any_of(queue_.begin(), queue_.end(), [](const auto& t) {
+        return t->row && t->in_progress && !t->settling;
+    });
+}
+
+// What busy() did not see to its end is given back as well: the work of a
+// PGFile is repeatable — the next one reads db.file again, deletes and
+// writes the same file, nothing has left this host — and a row kept to its
+// lease would be closed by the sweep, the disk copy stale (D.DEV.05). A row
+// whose confirmation is on the way is left alone. In one batch on the
+// listener, as the subscriber does it: the pool's connections may be held by
+// work that hangs.
+void PGFile::stop_notify()
+{
+    if (!notify_)
+        return;
+
+    const int number = notify_->number();
+
+    std::string sql;
+    if (number != 0)
+        sql += fmt::format("SELECT notify.drain({}); ", number);
+
+    std::size_t refused = 0;
+    const auto snapshot = queue_;
+    for (const auto& task : snapshot) {
+        if (!task->row || task->settling)
+            continue;
+
+        sql += fmt::format(
+            "DO $pgfile$ BEGIN PERFORM notify.nack({}, {}, 'unsent: stopping, the file not finished'); "
+            "EXCEPTION WHEN SQLSTATE 'NT409' THEN NULL; END $pgfile$; ",
+            task->row->id, task->row->token);
+        ++refused;
+        task->settling = true;
+        remove_task(task);
+    }
+
+    if (number != 0)
+        sql += fmt::format("SELECT notify.unsubscribe({})", number);
+
+    if (!sql.empty()) {
+        log_.notice("PGFile: subscriber {} of file stopping — {} unfinished row(s) given back, deregistering",
+                    number, refused);
+        try {
+            pool_.listener_execute(std::move(sql),
+                [this](std::vector<PgResult> results) {
+                    const auto bad = std::find_if(results.begin(), results.end(),
+                        [](const PgResult& r) { return !r.ok(); });
+                    if (bad != results.end())
+                        log_.error("PGFile: the subscriber of file did not stop cleanly: {}", bad->error_message());
+                },
+                {}, /*quiet=*/false);
+        } catch (const std::exception& e) {
+            // The rows return by their lease, the subscriber is forgotten by
+            // its heartbeat: nothing here outlives the process.
+            log_.error("PGFile: the subscriber of file not deregistered, the pool refused: {}", e.what());
+        }
+    }
+
+    notify_.reset();
+}
+
+#endif // PGFILE_NOTIFY
 
 } // namespace apostol
 
