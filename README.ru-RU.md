@@ -93,6 +93,14 @@ CREATE OR REPLACE FUNCTION schema.my_done (
 }
 ```
 
+Ключи секции модуля:
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `path` | `<prefix>/files` | корень файлового кэша |
+| `timeout` | `60` | таймаут скачивания, секунды |
+| `max_file_size` | предел фреймворка (64 МиБ) | наибольший файл, скачиваемый по URL, байты; `0` — без предела. Файл больше завершает задачу ошибкой `fetch error: response larger than <n> bytes` |
+
 Связанные модули
 -
 - **[FileServer](https://github.com/apostoldevel/module-FileServer)** — раздаёт файлы, управляемые PGFile, по HTTP (`GET /file/...`)

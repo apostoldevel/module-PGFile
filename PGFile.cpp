@@ -8,6 +8,9 @@
 #include "apostol/pg_utils.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <limits>
 #include <cstdlib>
 
 #include <fmt/format.h>
@@ -41,6 +44,55 @@ bool leader_gate(const Settings& s)
         return false;
 }
 
+// The limit on a fetched file's size (libapostol: set_max_response_size). A
+// libapostol without it has no limit to set: false.
+template <typename Client>
+bool set_size_limit(Client& c, std::size_t bytes)
+{
+    if constexpr (requires { c.set_max_response_size(bytes); }) {
+        c.set_max_response_size(bytes);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// module.PGFile.max_file_size: a whole number of bytes up to 2^63 - 1 (the
+// largest limit libcurl takes), 0 — no limit; written as a string when it
+// comes from the environment ("${VAR}"), an empty or blank one is an absent
+// key. Anything else: nullopt and `bad` set.
+std::optional<std::size_t> read_size(const nlohmann::json& v, bool& bad)
+{
+    constexpr unsigned long long top = static_cast<unsigned long long>(std::numeric_limits<long long>::max());
+    const auto fits = [&](unsigned long long n) -> std::optional<std::size_t> {
+        if (n > top || n > std::numeric_limits<std::size_t>::max()) {
+            bad = true;
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(n);
+    };
+
+    bad = false;
+    if (v.is_number_unsigned())
+        return fits(v.get<unsigned long long>());
+    if (v.is_number_integer() && v.get<long long>() >= 0)
+        return fits(static_cast<unsigned long long>(v.get<long long>()));
+    if (v.is_string()) {
+        const auto& s     = v.get_ref<const std::string&>();
+        const auto  space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+        const auto  b     = std::find_if_not(s.begin(), s.end(), space);
+        if (b == s.end())
+            return std::nullopt;
+        const auto e = std::find_if_not(s.rbegin(), s.rend(), space).base();
+        unsigned long long n = 0;
+        const auto [end, ec] = std::from_chars(&*b, &*b + (e - b), n);
+        if (ec == std::errc() && end == &*b + (e - b))
+            return fits(n);
+    }
+    bad = true;
+    return std::nullopt;
+}
+
 } // namespace
 
 // ─── Construction ────────────────────────────────────────────────────────────
@@ -58,15 +110,26 @@ PGFile::PGFile(Application& app, EventLoop& loop)
     , node_(app.node_id())
 #endif
 {
-    // Read path and timeout from config
+    // Read path, timeout and the file size limit from config
     std::string path_str;
     int timeout = 60;
+    std::optional<std::size_t> max_size;
     if (auto* cfg = app.module_config("PGFile")) {
         if (cfg->contains("path"))
             path_str = (*cfg)["path"].get<std::string>();
         if (cfg->contains("timeout") && (*cfg)["timeout"].is_number())
             timeout = (*cfg)["timeout"].get<int>();
+        if (cfg->contains("max_file_size")) {
+            bool bad = false;
+            max_size = read_size((*cfg)["max_file_size"], bad);
+            if (bad)
+                log_.warn("PGFile: max_file_size {} is not a whole number of bytes, the default limit stays",
+                          (*cfg)["max_file_size"].dump());
+        }
     }
+
+    if (max_size && !set_size_limit(fetch_, *max_size))
+        log_.warn("PGFile: max_file_size ignored, this build has no limit on a fetched file");
 
     files_path_ = app.resolve_path(path_str, "files");
     timeout_secs_ = timeout > 0 ? timeout : 60;

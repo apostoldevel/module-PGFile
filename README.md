@@ -93,6 +93,14 @@ Enable the module in the Apostol configuration file:
 }
 ```
 
+Keys of the module section:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | `<prefix>/files` | root of the file cache |
+| `timeout` | `60` | download timeout, seconds |
+| `max_file_size` | the framework's limit (64 MiB) | largest file fetched by URL, bytes; `0` — no limit. A larger file fails the task with `fetch error: response larger than <n> bytes` |
+
 Related modules
 -
 - **[FileServer](https://github.com/apostoldevel/module-FileServer)** — serves files managed by PGFile over HTTP (`GET /file/...`)
