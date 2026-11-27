@@ -567,7 +567,7 @@ void PGFile::do_file(std::shared_ptr<FileTask> task)
         },
         /*quiet=*/true,
         // authorize + get_file read and change nothing: sent again after a
-        // lost connection, as before T627.
+        // lost connection.
         PgRetry::if_lost);
     } catch (const std::exception& e) {
         // The pool refused: not started — the next heartbeat tries
@@ -1010,7 +1010,7 @@ bool PGFile::busy() const
 // What busy() did not see to its end is given back as well: the work of a
 // PGFile is repeatable — the next one reads db.file again, deletes and
 // writes the same file, nothing has left this host — and a row kept to its
-// lease would be closed by the sweep, the disk copy stale (D.DEV.05). A row
+// lease would be closed by the sweep, the disk copy stale. A row
 // whose confirmation is on the way is left alone. In one batch on the
 // listener, as the subscriber does it: the pool's connections may be held by
 // work that hangs.

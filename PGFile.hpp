@@ -36,7 +36,7 @@ class ModuleManager;
 // Helper module that synchronizes files between db.file and the filesystem,
 // on the events of the notify channel "file".
 //
-// Mirrors v1 CPGFile from debt-master.
+// Port of the v1 CPGFile.
 //
 // Two paths, by the mode of the notify channel `file` (notify.send decides
 // which one an event takes; both may be live during a switch):
